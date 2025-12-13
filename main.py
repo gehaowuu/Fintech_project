@@ -58,6 +58,26 @@ def te_credential_string() -> str:
     return key
 
 
+def te_login() -> Tuple[bool, Optional[str]]:
+    """兼容仅 key 或 key:secret 的登录方式（部分账号没有 secret 也能用）。"""
+    try:
+        import tradingeconomics as te  # type: ignore
+    except Exception as exc:
+        return False, f"tradingeconomics package not available: {exc}"
+    key = (TE_CLIENT_KEY or "").strip()
+    secret = (TE_CLIENT_SECRET or "").strip()
+    if not key:
+        return False, "TE_CLIENT_KEY missing"
+    try:
+        if secret:
+            te.login(f"{key}:{secret}")
+        else:
+            te.login(key)
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+
+
 def _load_json(path: str, default: Any) -> Any:
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -110,7 +130,11 @@ def get_te_calendar_events(
         return [], "TradingEconomics credentials missing (TE_CLIENT_KEY/TE_CLIENT_SECRET)."
 
     now_ts = time.time()
-    if _circuit_open(now_ts):
+    circuit = _load_json(TE_CIRCUIT_PATH, {})
+    circuit_open = now_ts < float(circuit.get("blocked_until_ts", 0))
+    last_try_date = circuit.get("last_try_date")
+    today_str = dt.date.today().isoformat()
+    if circuit_open and last_try_date == today_str:
         cached = _load_json(TE_CACHE_PATH, {})
         if cached.get("events"):
             return cached["events"], "TradingEconomics calendar skipped (circuit open). Using cached events."
@@ -138,6 +162,8 @@ def get_te_calendar_events(
             r = requests.get(url, params=params, headers=headers, timeout=timeout)
         if r.status_code == 403:
             _set_circuit(hours=6, reason="TE 403 Forbidden (quota/blocked)")
+            circuit["last_try_date"] = today_str
+            _save_json(TE_CIRCUIT_PATH, circuit)
             cached = _load_json(TE_CACHE_PATH, {})
             if cached.get("events"):
                 return cached["events"], "TradingEconomics 403; using cached events."
@@ -182,6 +208,8 @@ def get_te_calendar_events(
             "events": events,
         },
     )
+    circuit["last_try_date"] = today_str
+    _save_json(TE_CIRCUIT_PATH, circuit)
 
     note = f"TradingEconomics calendar window: {start} to {end}, importance>={importance_min}."
     return events, note
@@ -219,6 +247,47 @@ def fred_latest_observation(series_id: str, timeout: int = 15, max_rows: int = 1
         return None, f"No valid observation found for {series_id}."
     except Exception as e:
         return None, f"FRED observations failed for {series_id}: {e}"
+
+
+# -------- FRED releases fallback for events --------
+EVENT_RELEASES = [
+    {"name": "CPI", "release_id": 10},
+    {"name": "Employment Situation", "release_id": 50},
+    {"name": "Retail Sales", "release_id": 31},
+    {"name": "GDP", "release_id": 53},
+]
+
+
+def fred_last_release_date(release_id: int, timeout: int = 15) -> Optional[str]:
+    if not FRED_API_KEY:
+        return None
+    url = "https://api.stlouisfed.org/fred/release/dates"
+    params = {
+        "api_key": FRED_API_KEY,
+        "file_type": "json",
+        "release_id": release_id,
+        "sort_order": "desc",
+        "limit": 1,
+    }
+    try:
+        r = requests.get(url, params=params, timeout=timeout)
+        r.raise_for_status()
+        data = r.json() or {}
+        dates = data.get("release_dates", []) or []
+        if dates:
+            return dates[0].get("date")
+    except Exception:
+        return None
+    return None
+
+
+def build_events_fred(timeout: int = 15) -> List[Dict[str, Any]]:
+    events: List[Dict[str, Any]] = []
+    for item in EVENT_RELEASES:
+        d = fred_last_release_date(item["release_id"], timeout=timeout)
+        if d:
+            events.append({"event": item["name"], "last_release_date": d, "source": "FRED"})
+    return events
 
 
 # -------- CBOE PCR helpers --------
@@ -303,6 +372,7 @@ def get_cboe_put_call_ratio(timeout: int = 15) -> Tuple[Optional[Dict[str, Any]]
     """
     返回 total/equity/index put/call ratio 最新值，按顺序尝试三个官方 CSV，兼容说明行/不同表头。
     """
+    max_stale_days = 7
     url_candidates = [
         ("cboe-totalpc", "https://cdn.cboe.com/resources/options/volume_and_call_put_ratios/totalpc.csv"),
         ("cboe-equitypc", "https://cdn.cboe.com/resources/options/volume_and_call_put_ratios/equitypc.csv"),
@@ -313,6 +383,13 @@ def get_cboe_put_call_ratio(timeout: int = 15) -> Tuple[Optional[Dict[str, Any]]
         try:
             text = _download_text(url, timeout=timeout)
             value, date_str = _parse_pc_csv(text)
+            try:
+                latest_date = dt.datetime.strptime(date_str, "%Y-%m-%d").date()
+                if latest_date < (dt.date.today() - dt.timedelta(days=max_stale_days)):
+                    last_error = f"{url} stale ({date_str})"
+                    continue
+            except Exception:
+                pass
             return {"value": value, "date": date_str, "source": source, "url": url}, None
         except Exception as e:
             last_error = f"{url} failed: {e}"
@@ -494,6 +571,15 @@ def fetch_fundamentals(date_str: str) -> Dict[str, Any]:
     events, events_note = get_te_calendar_events(
         countries=("united states",), lookback_days=7, lookforward_days=7, importance_min=2
     )
+    # 如果 TE 不可用，则尝试 FRED release dates 作为弱替代
+    if not events:
+        fred_events = build_events_fred()
+        if fred_events:
+            events = fred_events
+            if events_note:
+                events_note += " | Fallback to FRED releases."
+            else:
+                events_note = "Fallback to FRED releases."
 
     news: List[Dict[str, Any]] = []
     try:
