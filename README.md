@@ -87,7 +87,7 @@ API 凭证：
 
 
 
-**- FRED：     **
+**- FRED：**
 
 from fredapi import Fred     fred = Fred(api\_key=os.getenv('FRED\_API\_KEY'))     series = fred.get\_series('DGS2', start\_date, end\_date)     
 
