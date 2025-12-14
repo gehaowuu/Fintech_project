@@ -1,0 +1,256 @@
+【文档名称】主要功能说明 & Render 前后端对接指导（后端部分）
+【对应后端主文件】main_v3.py
+【服务类型】Python FastAPI（REST API）
+【用途】本服务负责采集宏观/流动性/情绪/技术面数据，生成市场快照（snapshot），并可调用 Gemini 3 生成模块/整体分析与对话回复。
+
+================================================================================
+1. 一句话概览（给产品/设计/前端）
+--------------------------------------------------------------------------------
+- 这是一个“市场数据中间件 + LLM 分析后端”。
+- 前端的标准流程：登录（密码）→ 生成快照 → 拉取快照 → 触发 LLM 分析（单模块/总体）→ 基于快照做多轮对话。
+
+================================================================================
+2. 本地运行与手动测试（Windows / PowerShell）
+--------------------------------------------------------------------------------
+2.1 安装与启动
+- 建议 Python：3.10+
+- 安装依赖：
+  - 在项目根目录执行：pip install -r requirements.txt
+- 配置环境变量（推荐在 main_v3.py 同目录放置 .env；也可用系统环境变量）：
+  - APP_PASSWORD：开启登录鉴权用的密码（不设置则默认不鉴权）
+  - GEMINI_API_KEY 或 GOOGLE_API_KEY：Gemini API Key（不设置则 LLM 功能不可用）
+  - FRED_API_KEY：FRED 数据 Key（不设置则宏观/流动性部分会缺失）
+  - TE_CLIENT_KEY / TE_CLIENT_SECRET：TradingEconomics（不设置则经济日历为空）
+  - GEMINI_MODEL（可选，默认 gemini-3-pro-preview）
+  - GEMINI_THINKING_LEVEL（可选，low/high，默认 high）
+  - CORS_ALLOW_ORIGINS（可选，前端联调用；逗号分隔；不设默认 *）
+
+- 启动方式（二选一）：
+  A) 直接运行脚本（自动读取 PORT 环境变量，默认 8000）：
+     python main_v3.py
+
+  B) 用 uvicorn（推荐开发态，支持 --reload）：
+     uvicorn main_v3:app --reload --host 0.0.0.0 --port 8000
+
+- 访问文档：
+  - Swagger： http://127.0.0.1:8000/docs
+  - OpenAPI JSON： http://127.0.0.1:8000/openapi.json
+
+2.2 PowerShell 手动测试（推荐：Invoke-RestMethod）
+注意：PowerShell 里的 curl 默认是 Invoke-WebRequest 的别名，参数与 Linux curl 不一样。建议用 Invoke-RestMethod。
+
+(1) 健康检查
+$base = "http://127.0.0.1:8000"
+Invoke-RestMethod -Method Get -Uri "$base/health"
+
+(2) 登录（POST + JSON body）
+$login = Invoke-RestMethod -Method Post -Uri "$base/auth/login" -ContentType "application/json" -Body (@{ password = "你的密码" } | ConvertTo-Json)
+$token = $login.token
+
+(3) 生成快照（受保护，需要 token）
+$snap = Invoke-RestMethod -Method Post -Uri "$base/v3/snapshot/run" -Headers @{ Authorization = "Bearer $token" }
+$snapshot_id = $snap.id
+
+(4) 获取快照（受保护）
+Invoke-RestMethod -Method Get -Uri "$base/v3/snapshot/$snapshot_id" -Headers @{ Authorization = "Bearer $token" }
+
+(5) 单模块分析（可先 call_llm=false 只看 prompt）
+Invoke-RestMethod -Method Post -Uri "$base/v3/analysis/module" -Headers @{ Authorization = "Bearer $token" } -ContentType "application/json" -Body (@{ snapshot_id = $snapshot_id; module = "fundamentals"; call_llm = $false } | ConvertTo-Json)
+
+(6) 总体分析（call_llm=true 会触发 Gemini，建议先确认 GEMINI_API_KEY 已配）
+Invoke-RestMethod -Method Post -Uri "$base/v3/analysis/overall" -Headers @{ Authorization = "Bearer $token" } -ContentType "application/json" -Body (@{ snapshot_id = $snapshot_id; call_llm = $true; include_module_summaries = $true } | ConvertTo-Json)
+
+(7) Chat（基于快照的多轮对话）
+Invoke-RestMethod -Method Post -Uri "$base/v3/chat" -Headers @{ Authorization = "Bearer $token" } -ContentType "application/json" -Body (@{ snapshot_id = $snapshot_id; messages = @(@{ role = "user"; content = "用一句话总结今天的风险偏好" }) } | ConvertTo-Json -Depth 6)
+
+2.3 常见本地问题（你之前“无法登录”的原因）
+- /auth/login 必须用 POST，并且建议用 JSON body：{"password":"..."}
+- 浏览器跨域时 cookie 很容易因为 SameSite/HTTPS 限制而不发送，所以前端对接建议用 token + Authorization 头。
+
+================================================================================
+3. Render 部署（后端 Web Service）
+--------------------------------------------------------------------------------
+Render 最推荐的方式是“从 Git 仓库部署”（GitHub/GitLab）。本项目根目录已有 requirements.txt，Render 可直接识别。
+
+3.1 在 Render 创建 Web Service（Python）
+- Service Type：Web Service
+- Runtime：Python
+- Build Command：
+  pip install -r requirements.txt
+- Start Command（推荐）：
+  uvicorn main_v3:app --host 0.0.0.0 --port $PORT
+  说明：Render 会注入 PORT 环境变量；必须监听 0.0.0.0。
+- Health Check Path：
+  /health
+
+3.2 Render 环境变量（Environment Variables）
+必须/建议设置：
+- APP_PASSWORD：建议必设（否则默认不鉴权，任何人都能调用你的数据/LLM 配额）
+- GEMINI_API_KEY（或 GOOGLE_API_KEY）：启用 LLM 分析/聊天
+- FRED_API_KEY：启用 FRED 宏观/流动性数据
+- TE_CLIENT_KEY、TE_CLIENT_SECRET：启用 TradingEconomics 经济日历
+- CORS_ALLOW_ORIGINS：前端域名白名单（逗号分隔）
+  例：CORS_ALLOW_ORIGINS=https://your-frontend.onrender.com
+可选：
+- GEMINI_MODEL：默认 gemini-3-pro-preview
+- GEMINI_THINKING_LEVEL：low 或 high（默认 high）
+- TE_CACHE_PATH、TE_CIRCUIT_PATH：TE 日历缓存/熔断文件路径（默认在当前工作目录）
+
+3.3 Render 上线注意事项（重要）
+- 会话/快照是“内存存储”：
+  - 登录 token（session）和 snapshot_cache 都在内存里，服务重启或重新部署会丢失。
+  - 如果你把服务扩到多实例（多副本），不同实例之间不会共享 session/snapshot。
+  - 因此：建议先保持 1 个实例；前端遇到 401/404 时引导重新登录/重新生成快照。
+- 免费套餐可能会休眠：长期无请求会冷启动；可用定时 ping /health 保活（按 Render 规则）。
+
+================================================================================
+4. 前端对接关键点（浏览器调用）
+--------------------------------------------------------------------------------
+4.1 鉴权方案（推荐：token 模式）
+- 登录成功后后端会返回：
+  {"message":"login successful","token":"<hex>"}
+- 前端将 token 暂存（内存/本地存储自行选择），后续请求统一加：
+  Authorization: Bearer <token>
+- 不推荐依赖 cookie（跨站 cookie 在现代浏览器限制较多；本项目也默认 allow_credentials=false）。
+
+4.2 CORS
+- 后端已内置 CORS 中间件。
+- 生产建议在 Render 设置：CORS_ALLOW_ORIGINS=你的前端域名
+- 若前端和后端同域（反向代理/同服务域名）可不需要 CORS，但 Render 常见是不同域名。
+
+4.3 前端页面/调用流程建议
+- 登录页：输入 APP_PASSWORD → POST /auth/login → 拿到 token
+- 主页：点击“生成今日快照” → POST /v3/snapshot/run → 得到 snapshot_id
+- 快照页：GET /v3/snapshot/{snapshot_id} 渲染四大模块数据/标签/信号
+- 分析页：
+  - 单模块：POST /v3/analysis/module
+  - 总体：POST /v3/analysis/overall
+- 对话页：POST /v3/chat（messages 为数组，多轮时把历史一起传回）
+
+4.4 错误码约定（前端要处理）
+- 401 Authentication required：token 失效/未登录 → 跳转登录
+- 401 Invalid password：密码错误 → 提示重试
+- 404 Snapshot not found：快照不存在/后端重启丢内存 → 重新生成快照
+- 400 Invalid module name：module 参数不合法
+- 500：后端抓取数据/外部 API 异常
+
+================================================================================
+5. API 接口说明（给前端直接对接）
+--------------------------------------------------------------------------------
+统一说明：
+- Base URL：
+  - 本地：http://127.0.0.1:8000
+  - Render：https://<your-backend-service>.onrender.com
+- 鉴权：除 /health 与 /v1/context 外，其余 v3 接口都需要鉴权。
+  - Header 方式：Authorization: Bearer <token>
+  - 或 Header：X-Session-Token: <token>
+  - 或 Cookie：session=<token>（不推荐前端跨域使用）
+
+5.1 GET /health
+- Auth：否
+- Response：{"status":"ok"}
+
+5.2 POST /auth/login
+- Auth：否
+- Body(JSON)：{"password":"<APP_PASSWORD>"}
+  - 兼容：也支持 query ?password=...
+- Response(JSON)：{"message":"login successful","token":"<hex>"}
+- Side-effect：同时设置 cookie：session=<token>
+
+5.3 POST /auth/logout
+- Auth：是（cookie 或 header 任一）
+- Response(JSON)：{"message":"logged out"}
+
+5.4 GET /v1/context?date=YYYY-MM-DD
+- Auth：否（公开接口，适合 Dify 拉数据；若你希望也保护它，可自行改为 Depends(require_auth)）
+- Query：date 可选，不传则默认今天
+- Response：
+  - 四大模块 fundamentals/liquidity/sentiment/technicals
+  - labels
+  - prompt_context（给 LLM 的文本摘要）
+
+5.5 POST /v3/snapshot/run?date=YYYY-MM-DD
+- Auth：是
+- Query：date 可选
+- Response：snapshot 对象
+  - id：快照 id
+  - date：日期
+  - modules：四大模块原始数据
+  - labels：启发式标签
+  - signals：面向 LLM 的轻量信号列表
+  - heuristics：按模块的标签
+  - data_quality：缺失字段列表
+
+5.6 GET /v3/snapshot/{snapshot_id}
+- Auth：是
+- Response：与 /v3/snapshot/run 返回的 snapshot 结构一致
+
+5.7 POST /v3/analysis/module
+- Auth：是
+- Body(JSON)：
+  {
+    "snapshot_id": "...",
+    "module": "fundamentals|liquidity|sentiment|technicals",
+    "call_llm": true,
+    "provider": null,
+    "model": "gemini-3-pro-preview"
+  }
+- Response(JSON)：
+  - module/signals/heuristic_label/data_quality
+  - system_prompt/user_prompt
+  - 当 call_llm=true：analysis / llm_error / llm_provider / llm_model
+
+5.8 POST /v3/analysis/overall
+- Auth：是
+- Body(JSON)：
+  {
+    "snapshot_id": "...",
+    "call_llm": true,
+    "include_module_summaries": true,
+    "provider": null,
+    "model": "gemini-3-pro-preview"
+  }
+- Response(JSON)：
+  - system_prompt/user_prompt/labels
+  - include_module_summaries=true 时：heuristics/data_quality/signals
+  - 当 call_llm=true：analysis / llm_error / llm_provider / llm_model
+
+5.9 POST /v3/chat
+- Auth：是
+- Body(JSON)：
+  {
+    "snapshot_id": "...",
+    "messages": [
+      {"role":"user","content":"..."},
+      {"role":"assistant","content":"..."}
+    ],
+    "provider": null,
+    "model": "gemini-3-pro-preview"
+  }
+- Response(JSON)：
+  - system_prompt
+  - reply（模型回复）或 llm_error
+
+================================================================================
+6. 主要内部功能点（便于前端理解数据从何而来）
+--------------------------------------------------------------------------------
+- 数据采集源：
+  - FRED：利率/资产负债表/逆回购/TGA 等
+  - Yahoo Finance(yfinance)：DXY、VIX、ETF/指数/商品/加密等价格
+  - TradingEconomics：经济日历（可缓存/熔断）
+  - Google News RSS：宏观新闻
+  - CBOE CSV：Put/Call Ratio
+  - CNN Fear&Greed：优先 third-party 包，失败则走 CNN API / CSV 兜底
+
+- 核心产出：
+  - labels：启发式宏观/流动性/情绪/技术面 regime
+  - signals：压缩后的信号列表（更适合喂给 LLM）
+  - prompt_context：面向 LLM 的整段文本摘要
+
+================================================================================
+7. 备注（当前设计的边界）
+--------------------------------------------------------------------------------
+- 本项目为“轻量可跑通原型”，session 与 snapshot 都是内存态；需要强一致/多实例/持久化时建议引入 Redis/数据库。
+- 若要在浏览器里使用 cookie 鉴权，需要调整：CORS allow_credentials=true、cookie SameSite=None + Secure=true，并确保全站 HTTPS；当前推荐使用 Bearer token 方案。
+
+【文档结束】
