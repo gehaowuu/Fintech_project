@@ -3,6 +3,7 @@ import logging
 import time
 import json
 import io
+import ssl
 import datetime as dt
 from datetime import datetime, timedelta, date, timezone
 from io import StringIO
@@ -28,6 +29,32 @@ load_dotenv(os.path.join(_BASE_DIR, ".env"))
 logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title="Finance Middleware", version="0.1.0")
+
+# -----------------------------------------------------------------------------
+# LLM Prompt Templates (统一管理，便于前端/产品对齐)
+#
+# 说明：
+# - A) GLOBAL_SYSTEM_PROMPT：所有端点共用的系统提示词（硬约束/风格/目标）
+# - B) build_module_user_prompt：按钮1「模块AI简析」使用的用户提示词模板
+# - C) build_overall_user_prompt：按钮2「综合AI专业分析」使用的用户提示词模板
+# - D) build_chat_system_prompt：Chat 端点使用的系统提示词（可注入 last_overall_report）
+#
+
+GLOBAL_SYSTEM_PROMPT = """
+你是一名买方宏观与跨资产策略分析师（Multi-Asset Macro PM）。你的输出将用于投委会/交易晨会决策支持。
+
+硬约束（必须遵守）：
+1) 严格基于输入数据推断，不得臆造未提供的事实、数值、日期、网页内容；若未提供/无法确认，必须明确写“缺失/无法确认”。
+2) 如输入包含 supplemental（外部补充数据），仅当 supplemental 字段带有“来源URL + 抓取日期/数据日期”且与快照日期逻辑一致时才可使用；否则视为不可用并说明原因。
+3) 允许你对输入中的“启发式标签(heuristic_label)”进行覆盖，但必须给出：scorecard 打分、覆盖理由、以及覆盖所依赖的关键证据。
+4) 输出必须结构化、可复核：每个结论都要能追溯到“指标 → 推理链条 → 结论”。
+5) 输出中文，要点化；避免空话与泛泛科普；避免给出“下一步必须盯的3个数据点”这种独立章节。
+   如有缺失数据，用条件句表达：例如“后续关注X；若X上行/下行至Y，将提高/降低Z结论置信度”。
+
+目标：
+- 给出当日市场环境（regime）与跨资产传导逻辑；
+- 在不完整数据下，仍完成“最低可用”的分析闭环，并清晰标注不确定性来自何处。
+""".strip()
 
 # -----------------------------------------------------------------------------
 # CORS (给前端调用用)
@@ -91,6 +118,292 @@ GEMINI_DEFAULT_THINKING_LEVEL = (os.getenv("GEMINI_THINKING_LEVEL") or "high").s
 if GEMINI_DEFAULT_THINKING_LEVEL not in {"low", "high"}:
     GEMINI_DEFAULT_THINKING_LEVEL = "high"
 
+def _normalize_gemini_model_name(model: Optional[str]) -> str:
+    """Normalize user-provided model names.
+
+    FastAPI /docs 会把可选字符串字段展示为占位符 \"string\"；如果用户不改就提交，
+    会导致调用 `models/string` 从而报 404。这里将这些占位符/空值统一回退到默认模型。
+    """
+    if model is None:
+        return GEMINI_DEFAULT_MODEL
+    m = str(model).strip()
+    if not m:
+        return GEMINI_DEFAULT_MODEL
+    if m.lower() in {"string", "none", "null", "undefined"}:
+        return GEMINI_DEFAULT_MODEL
+    return m
+
+
+def _should_retry_gemini_exception(exc: Exception) -> bool:
+    """Heuristic retry policy for transient network/TLS issues.
+
+    We only retry on low-level transport errors (e.g. SSL handshake, connect
+    reset, timeouts). API errors like 4xx/5xx are handled by the SDK and should
+    not be retried here.
+    """
+    if isinstance(exc, ssl.SSLError):
+        return True
+    # httpx/httpcore transport errors (google-genai uses httpx under the hood)
+    try:
+        import httpx  # type: ignore
+
+        if isinstance(exc, httpx.HTTPError):
+            return True
+    except Exception:
+        pass
+    msg = str(exc).lower()
+    return any(
+        needle in msg
+        for needle in (
+            "handshake failure",
+            "sslv3_alert_handshake_failure",
+            "tls",
+            "ssl",
+            "connection reset",
+            "connection aborted",
+            "timed out",
+            "timeout",
+            "temporarily unavailable",
+        )
+    )
+
+
+def _format_signal_value(val: Any) -> str:
+    """Format values for prompts to avoid ugly float repr like 0.6199999997."""
+    if val is None:
+        return "n/a"
+    if isinstance(val, bool):
+        return "true" if val else "false"
+    if isinstance(val, (int, float)):
+        # keep 4 decimals for rates/spreads; 2 for others is too lossy sometimes
+        return _fmt_num(float(val), 4)
+    if isinstance(val, dt.date):
+        return str(val)
+    if isinstance(val, (list, tuple)):
+        return "[" + ", ".join(_format_signal_value(x) for x in val[:20]) + (", ..." if len(val) > 20 else "") + "]"
+    if isinstance(val, dict):
+        items = []
+        for k, v in list(val.items())[:30]:
+            items.append(f"{k}:{_format_signal_value(v)}")
+        suffix = ", ..." if len(val) > 30 else ""
+        return "{" + ", ".join(items) + suffix + "}"
+    return str(val)
+
+
+def build_module_user_prompt(
+    module_name: str,
+    as_of_date: str,
+    signals: List[Dict[str, Any]],
+    heuristic_label: Optional[str],
+    missing: List[str],
+    supplemental: Optional[str] = None,
+) -> str:
+    """按钮1：模块短评 Prompt（四模块通用模板，按规范输出）。"""
+    module_lower = (module_name or "").lower().strip()
+    module_display = module_lower or module_name
+
+    # signals -> text
+    parts: List[str] = []
+    for s in signals:
+        name = s.get("name")
+        val = s.get("value")
+        if isinstance(val, dict):
+            # compact dict
+            inner = ", ".join(f"{k}:{_format_signal_value(v)}" for k, v in val.items())
+            parts.append(f"{name}({inner})")
+        else:
+            parts.append(f"{name}={_format_signal_value(val)}")
+    signals_text = "; ".join(parts) if parts else "(无)"
+
+    missing_text = ", ".join(missing) if missing else "无"
+    supplemental_text = (supplemental or "").strip() or "（空）"
+    heuristic_text = heuristic_label if heuristic_label is not None else "（无）"
+
+    # candidate set by module
+    candidate_map = {
+        "fundamentals": "Hawkish / Neutral / Dovish",
+        "liquidity": "Expansionary / Neutral / Tightening",
+        "sentiment": "Risk-On / Neutral / Risk-Off",
+        "technicals": "Uptrend / Range / Downtrend",
+    }
+    candidates = candidate_map.get(module_lower, "（按模块自定，但必须从预定义集合中选）")
+
+    # Suggested scorecard anchors (helps controllability / dashboard)
+    scorecard_hint_map = {
+        "fundamentals": [
+            "期限结构（10Y-2Y、曲线形态）",
+            "政策定价（FFR-2Y 或相关替代）",
+            "美元（DXY）",
+            "交叉验证（Real10Y / Breakeven / 信用利差 OAS 若有；缺失则 NA）",
+        ],
+        "liquidity": [
+            "净流动性水平（Net Liquidity）",
+            "净流动性变化（Δ4w）",
+            "组成项驱动（WALCL/RRP/TGA）",
+            "交叉验证（信用比率 HYG/IEI 或 OAS 若有；缺失则 NA）",
+        ],
+        "sentiment": [
+            "Fear&Greed（FGI）",
+            "VIX 期限结构（VIX vs VIX3M / contango/backwardation）",
+            "Put/Call（或其均值）",
+            "交叉验证（风险价差 SPY-XLU / HYG-IEF / BTC-Gold 之一；缺失则 NA）",
+        ],
+        "technicals": [
+            "趋势（MA20/50/200 距离 + trend_label）",
+            "波动/结构（ATR%、boll_width）",
+            "广度（RSP-SPX）",
+            "交叉验证（风格比 XLK/XLP 或相关；缺失则 NA）",
+        ],
+    }
+    hint_lines = scorecard_hint_map.get(module_lower, [])
+    hint_text = "\n".join([f"  - {x}" for x in hint_lines]) if hint_lines else "  - （由你自行选取 2-6 个关键指标）"
+
+    return f"""
+你将分析单个模块：{module_display}
+快照日期：{as_of_date}
+
+【输入】
+- signals（原始信号）：{signals_text}
+- heuristic_label（启发式标签）：{heuristic_text}
+- data_quality_missing（缺失项）：{missing_text}
+- supplemental（外部补充数据，可能为空）：{supplemental_text}
+
+【输出要求：必须按以下标题与顺序输出】
+
+1) 数据可用性与关键不确定性（≤6条要点）
+- 说明哪些信号日期不一致/口径不清会影响结论
+- 若 supplemental 存在：只在“来源+日期可核对”时使用；否则写明“无法确认而未采用”
+
+2) 模块内部推理链条（至少2条，写成因果箭头）
+- 每条链条格式：
+  - 证据（指标/方向） → 机制解释（简短） → 对{module_display}的含义（偏宽松/偏紧/偏风险偏好等）
+
+3) Regime 判定（必须给 scorecard）
+- 候选集合（按模块自动选择）：{candidates}
+- Scorecard（每条：+1 / 0 / -1 / NA，并用一句话解释；建议选用如下锚点）：
+{hint_text}
+- 计算：总分 = …（你自己算）
+- 最终 Regime：…（必须来自候选集合）
+- 置信度（0-100）：…（必须解释置信度来自“数据完整度+一致性”）
+- Override Check：是否与 heuristic_label 一致？若不一致：必须解释为何覆盖，以及覆盖依赖的关键证据；同时写明“若补齐哪些数据将更确定”。
+
+4) 对主要风险资产的含义（只写条件句，2-4条）
+- 格式：后续关注X；若X走向Y，则该模块对风险资产的影响将更偏向Z（例如 risk-on/risk-off/高波动/轮动）。
+""".strip()
+
+
+def build_overall_user_prompt(
+    as_of_date: str,
+    prompt_context_text: str,
+    labels: Dict[str, str],
+    module_reports_or_empty: str,
+    supplemental_overall: Optional[str] = None,
+) -> str:
+    """按钮2：综合专业版 Prompt（固定结构 + 可复核链条 + 多资产细分）。"""
+    labels_text = (
+        f"- Macro: {labels.get('macro_regime')}\n"
+        f"- Liquidity: {labels.get('liquidity_regime')}\n"
+        f"- Sentiment: {labels.get('sentiment_regime')}\n"
+        f"- Technical: {labels.get('technical_regime')}"
+    )
+    supplemental_text = (supplemental_overall or "").strip() or "（空）"
+    module_reports_text = (module_reports_or_empty or "").strip() or "（无：尚未运行按钮1模块短评）"
+
+    return f"""
+你将获得一份市场快照（时间标签：{as_of_date}）。请仅基于该快照与可核对的 supplemental 完成分析。
+
+【输入】
+A) 快照汇总（你必须视为唯一事实来源）：
+{prompt_context_text}
+
+B) 既有标签（可能不准，允许覆盖但要给证据）：
+{labels_text}
+
+C) 可选：模块AI短评输出（如果上一步按钮1已经跑过，则会提供；没有也没关系）：
+{module_reports_text}
+
+D) supplemental（外部补充数据，可能为空；仅可在“来源+日期可核对”时使用）：
+{supplemental_text}
+
+【输出：必须按以下固定框架、标题一致、按序输出】
+
+1) 数据可用性与“结论可靠性边界”
+1.1 可用数据概况
+- 用一句话概括：当前快照覆盖了哪些维度（宏观/流动性/情绪/技术）以及缺什么
+1.2 关键缺失与影响（用“影响链条”写，不要列“下一步必须盯3个”）
+- 对每个关键缺失，写：缺失项 → 会影响哪条推理链 → 可能导致结论偏向哪里
+- 若 supplemental 存在但不可核对：说明“未采用”的原因（日期/来源/口径）
+
+2) Regime 拼图（跨模块一致性评估）
+2.1 四模块最终 regime（若模块短评为空，你需用快照自行判定并给 scorecard 逻辑）
+- Fundamentals：…（简短一句话理由）
+- Liquidity：…
+- Sentiment：…
+- Technicals：…
+2.2 一致性评分（0-100）与冲突解释
+- 评分规则（你自洽即可）：一致性高 + 数据完整 → 高分；相互打架或关键缺失多 → 低分
+- 用要点列出：最主要的 1-3 个“打架点”（例如：油价通缩信号 vs 黄金强势；BTC弱 vs 股强）
+
+3) 跨资产传导图谱（必须是“可复核链条”，至少3条）
+- 每条链条写成：起点指标（含方向） → 中介变量（含方向） → 终点资产（含方向）
+- 链条类型至少覆盖：
+  A) 利率/实际利率 → 美元 → 黄金（或相反）
+  B) 流动性 → 权益/信用/加密（区分敏感度）
+  C) 风险偏好/波动结构 → 资产内部轮动（小盘/等权/行业风格）
+
+4) 市场环境结论（专业、可交易，但不要求具体标的）
+4.1 Base Case（1-2周）
+- 用一句话给出：risk-on / risk-off / 区间轮动（必须选一个主基调）
+- 用条件句描述“可靠性边界”：后续关注X；若X出现Y，则Base Case 更强/更弱/转向
+4.2 1-3个月主线（增长/通胀/政策/流动性四要素）
+- 你必须明确：主导变量是哪一个（例如政策路径/流动性/增长担忧/通胀回落）
+- 同样用条件句描述：若出现…则主线切换
+4.3 Bull / Bear 场景（各2-3条触发条件 + 1条应对原则）
+- 触发条件必须落在“你已有的数据维度”或“可核对的 supplemental”上；缺失则写“需数据验证”
+
+5) 多资产细分分析（给你固定的专业框架）
+你必须分别输出：债市、股市（分3-5个行业/风格桶）、黄金/白银、BTC。
+每个资产用同一模板输出（必须按序）：
+A) 当前驱动拆解（宏观/流动性/技术或情绪各1条，总计3条）
+B) 当前偏向（多/空/中性/区间）+ 置信度（0-100）
+C) 关键条件句（2条）：后续关注X；若X→Y，则偏向更…/转为…
+D) 风控原则（2条）：仓位纪律/对冲思路/避免的行为（不许空泛）
+
+6) 结论摘要（用于Dashboard展示，≤10行）
+- 用“结论-证据”对照写：每行=一个结论 + 1个最关键证据
+- 禁止出现“下一步必须盯的3个数据点”这种独立段落
+""".strip()
+
+
+def build_chat_system_prompt(
+    as_of_date: str,
+    prompt_context_text: str,
+    last_overall_report_text_or_summary: Optional[str],
+) -> str:
+    """Chat Prompt（可选：把按钮2输出接进去，形成“连续问答”体验）。"""
+    report_text = (last_overall_report_text_or_summary or "").strip() or "（无：尚未生成综合专业报告）"
+    return (
+        GLOBAL_SYSTEM_PROMPT
+        + "\n\n"
+        + f"""
+你是投研助理，正在对同一份快照（{as_of_date}）提供持续问答支持。
+你必须严格基于以下两类信息回答：
+1) 快照原始数据（snapshot）
+2) 已生成的综合专业报告（last_overall_report）
+不得引入外部未提供信息，不得臆造网页内容。
+
+【snapshot】
+{prompt_context_text}
+
+【last_overall_report】
+{report_text}
+
+对用户问题的回答规则：
+- 先给结论（1-2句），再给证据点（最多3条，均需来自 snapshot 或 last_overall_report）
+- 若用户问到报告未覆盖且快照也没有的数据：明确说缺失，并用条件句说明“若未来补齐该数据，判断可能如何变化”
+""".strip()
+    )
+
 fred_client: Optional[Fred] = Fred(api_key=FRED_API_KEY) if FRED_API_KEY else None
 
 # Gemini API 配置
@@ -139,7 +452,7 @@ def call_gemini(
     try:
         full_prompt = f"{system_prompt}\n\n---\n\n{user_prompt}"
         
-        model_name = (model or GEMINI_DEFAULT_MODEL).strip() or GEMINI_DEFAULT_MODEL
+        model_name = _normalize_gemini_model_name(model)
         tl = (thinking_level or GEMINI_DEFAULT_THINKING_LEVEL).strip().lower()
         if tl not in {"low", "high"}:
             tl = GEMINI_DEFAULT_THINKING_LEVEL
@@ -162,11 +475,34 @@ def call_gemini(
                 "thinking_config": {"thinking_level": tl},
             }
 
-        response = gemini_client.models.generate_content(
-            model=model_name,
-            contents=full_prompt,
-            config=cfg,
-        )
+        # 网络/SSL 在部分环境会偶发握手失败；这里做轻量重试，避免一次性失败让体验很差
+        max_retries = max(0, int(os.getenv("GEMINI_MAX_RETRIES", "2")))
+        last_exc: Optional[Exception] = None
+        response = None
+        for attempt in range(max_retries + 1):
+            try:
+                response = gemini_client.models.generate_content(
+                    model=model_name,
+                    contents=full_prompt,
+                    config=cfg,
+                )
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= max_retries or not _should_retry_gemini_exception(exc):
+                    raise
+                sleep_s = 0.8 * (2**attempt)
+                logging.warning(
+                    "Gemini 调用失败（%s），%.1fs 后重试（%d/%d）",
+                    type(exc).__name__,
+                    sleep_s,
+                    attempt + 1,
+                    max_retries,
+                )
+                time.sleep(sleep_s)
+        if last_exc is not None or response is None:
+            raise last_exc or RuntimeError("Gemini call failed")
         
         if getattr(response, "text", None):
             return response.text, None
@@ -215,7 +551,7 @@ def call_gemini_chat(
         return None, "Gemini API 未配置（缺少 GEMINI_API_KEY）"
     
     try:
-        model_name = (model or GEMINI_DEFAULT_MODEL).strip() or GEMINI_DEFAULT_MODEL
+        model_name = _normalize_gemini_model_name(model)
         tl = (thinking_level or GEMINI_DEFAULT_THINKING_LEVEL).strip().lower()
         if tl not in {"low", "high"}:
             tl = GEMINI_DEFAULT_THINKING_LEVEL
@@ -246,23 +582,48 @@ def call_gemini_chat(
             role = "user" if msg.get("role") == "user" else "model"
             contents.append({"role": role, "parts": [{"text": msg.get("content", "")}]})
 
-        try:
-            response = gemini_client.models.generate_content(
-                model=model_name,
-                contents=contents,
-                config=cfg,
-            )
-        except Exception:
-            # 兼容：若 SDK 版本对 structured contents 支持不一致，则回退到拼接文本
+        # 兼容：若 SDK 版本对 structured contents 支持不一致，则回退到拼接文本
+        def _build_fallback_text() -> str:
             lines: List[str] = [system_prompt, "---"]
             for msg in messages:
                 r = "USER" if msg.get("role") == "user" else "ASSISTANT"
                 lines.append(f"{r}: {msg.get('content', '')}")
-            response = gemini_client.models.generate_content(
-                model=model_name,
-                contents="\n".join(lines),
-                config=cfg,
-            )
+            return "\n".join(lines)
+
+        max_retries = max(0, int(os.getenv("GEMINI_MAX_RETRIES", "2")))
+        last_exc: Optional[Exception] = None
+        response = None
+        for attempt in range(max_retries + 1):
+            try:
+                try:
+                    response = gemini_client.models.generate_content(
+                        model=model_name,
+                        contents=contents,
+                        config=cfg,
+                    )
+                except Exception:
+                    response = gemini_client.models.generate_content(
+                        model=model_name,
+                        contents=_build_fallback_text(),
+                        config=cfg,
+                    )
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= max_retries or not _should_retry_gemini_exception(exc):
+                    raise
+                sleep_s = 0.8 * (2**attempt)
+                logging.warning(
+                    "Gemini Chat 调用失败（%s），%.1fs 后重试（%d/%d）",
+                    type(exc).__name__,
+                    sleep_s,
+                    attempt + 1,
+                    max_retries,
+                )
+                time.sleep(sleep_s)
+        if last_exc is not None or response is None:
+            raise last_exc or RuntimeError("Gemini chat call failed")
         
         if getattr(response, "text", None):
             return response.text, None
@@ -1707,37 +2068,16 @@ async def analyse_module(req: ModuleAnalysisRequest, auth: Any = Depends(require
     signals = snapshot["signals"].get(module_name, [])
     heuristic_label = snapshot["heuristics"].get(module_name)
     missing = snapshot["data_quality"].get(module_name, [])
-    
-    # System prompt
-    system_prompt = (
-        "你是一名买方宏观与跨资产策略分析师。你必须严格基于输入数据推断，"
-        "不得臆造未提供的事实/数值；若数据缺失需明确标注。"
-        "输出需专业、结构化、可执行。"
-    )
-    
-    # Build a user prompt for this module
-    signals_text_parts = []
-    for s in signals:
-        val = s["value"]
-        if isinstance(val, dict):
-            sub = ", ".join(
-                [
-                    f"{k}:{_fmt_num(v) if isinstance(v, (int, float)) else v}"
-                    for k, v in val.items()
-                ]
-            )
-            signals_text_parts.append(f"{s['name']}({sub})")
-        else:
-            signals_text_parts.append(f"{s['name']}={val}")
-    signals_text = "; ".join(signals_text_parts)
-    missing_text = ", ".join(missing) if missing else "无"
-    user_prompt = (
-        f"以下是 {module_name} 模块的信号和粗略标签，请根据它们给出简短的分析：\n"
-        f"- 信号: {signals_text}\n"
-        f"- 预估标签: {heuristic_label}\n"
-        f"- 缺失指标: {missing_text}\n"
-        "你需要解释这些信号之间的关系并评估预估标签是否合理，指出数据缺口可能造成的偏差，"
-        "最后给出 2-3 条该模块对风险资产影响的简要结论。"
+
+    as_of_date = str(snapshot.get("date") or "")
+    system_prompt = GLOBAL_SYSTEM_PROMPT
+    user_prompt = build_module_user_prompt(
+        module_name=module_name,
+        as_of_date=as_of_date,
+        signals=signals,
+        heuristic_label=heuristic_label,
+        missing=missing,
+        supplemental=None,
     )
     
     response: Dict[str, Any] = {
@@ -1755,7 +2095,16 @@ async def analyse_module(req: ModuleAnalysisRequest, auth: Any = Depends(require
         if analysis_text:
             response["analysis"] = analysis_text
             response["llm_provider"] = "gemini"
-            response["llm_model"] = req.model or GEMINI_DEFAULT_MODEL
+            response["llm_model"] = _normalize_gemini_model_name(req.model)
+            # 保存模块短评，供按钮2综合分析/Chat 注入使用
+            try:
+                snapshot.setdefault("llm_module_reports", {})[module_name] = {
+                    "text": analysis_text,
+                    "llm_model": response["llm_model"],
+                    "created_ts": time.time(),
+                }
+            except Exception:
+                pass
         else:
             response["analysis"] = None
             response["llm_error"] = error
@@ -1790,11 +2139,44 @@ async def analyse_overall(req: OverallAnalysisRequest, auth: Any = Depends(requi
         raise HTTPException(status_code=404, detail="Snapshot not found")
     modules = snapshot["modules"]
     labels = snapshot["labels"]
-    prompts = build_llm_prompts(snapshot["date"], modules, labels)
+
+    # 可选：拼接按钮1模块短评输出（若已生成）
+    module_reports = snapshot.get("llm_module_reports") or {}
+    report_blocks: List[str] = []
+    for m in ["fundamentals", "liquidity", "sentiment", "technicals"]:
+        item = module_reports.get(m) if isinstance(module_reports, dict) else None
+        txt = (item.get("text") if isinstance(item, dict) else None) if item else None
+        if txt:
+            report_blocks.append(f"[{m}]\n{txt}")
+    module_reports_text = "\n\n".join(report_blocks) if report_blocks else ""
+
+    prompt_context_text = build_prompt_context(modules, labels)
+    # 额外把 data_quality（缺失项）显式写进输入，便于模型做“可靠性边界”
+    try:
+        dq = snapshot.get("data_quality") or {}
+        if isinstance(dq, dict) and dq:
+            dq_lines = []
+            for k in ["fundamentals", "liquidity", "sentiment", "technicals"]:
+                miss = dq.get(k) or []
+                miss_text = ", ".join(miss) if isinstance(miss, list) and miss else "无"
+                dq_lines.append(f"- {k}: {miss_text}")
+            prompt_context_text = prompt_context_text + "\n\n=== DATA_QUALITY_MISSING ===\n" + "\n".join(dq_lines)
+    except Exception:
+        pass
+
+    as_of_date = str(snapshot.get("date") or "")
+    system_prompt = GLOBAL_SYSTEM_PROMPT
+    user_prompt = build_overall_user_prompt(
+        as_of_date=as_of_date,
+        prompt_context_text=prompt_context_text,
+        labels=labels,
+        module_reports_or_empty=module_reports_text,
+        supplemental_overall=None,
+    )
     
     response: Dict[str, Any] = {
-        "system_prompt": prompts["system_prompt"],
-        "user_prompt": prompts["user_prompt"],
+        "system_prompt": system_prompt,
+        "user_prompt": user_prompt,
         "labels": labels,
     }
     
@@ -1806,8 +2188,8 @@ async def analyse_overall(req: OverallAnalysisRequest, auth: Any = Depends(requi
     # 调用 Gemini API
     if req.call_llm:
         analysis_text, error = call_gemini(
-            prompts["system_prompt"], 
-            prompts["user_prompt"],
+            system_prompt,
+            user_prompt,
             temperature=1.0,
             max_tokens=10240,  # 总体分析需要更长的输出
             model=req.model,
@@ -1815,7 +2197,14 @@ async def analyse_overall(req: OverallAnalysisRequest, auth: Any = Depends(requi
         if analysis_text:
             response["analysis"] = analysis_text
             response["llm_provider"] = "gemini"
-            response["llm_model"] = req.model or GEMINI_DEFAULT_MODEL
+            response["llm_model"] = _normalize_gemini_model_name(req.model)
+            # 保存综合专业版输出，供 Chat 注入使用
+            try:
+                snapshot["last_overall_report"] = analysis_text
+                snapshot["last_overall_report_model"] = response["llm_model"]
+                snapshot["last_overall_report_ts"] = time.time()
+            except Exception:
+                pass
         else:
             response["analysis"] = None
             response["llm_error"] = error
@@ -1853,10 +2242,17 @@ async def chat(req: ChatRequest, auth: Any = Depends(require_auth)) -> Dict[str,
     
     # 构建包含市场快照的系统提示词
     prompt_context = build_prompt_context(snapshot["modules"], snapshot["labels"])
-    system_prompt = (
-        "你是一名买方宏观与跨资产策略分析师。请参考以下市场快照并回答用户问题。\n"
-        "你必须严格基于提供的数据回答，不得臆造数据。如果数据不足以回答问题，请明确说明。\n\n"
-        + prompt_context
+    last_report = snapshot.get("last_overall_report")
+    # 避免把超长报告全部塞进 system prompt 导致成本/延迟暴涨：做一个安全截断
+    last_report_text = None
+    if isinstance(last_report, str) and last_report.strip():
+        max_chars = int(os.getenv("CHAT_LAST_REPORT_MAX_CHARS", "7000"))
+        txt = last_report.strip()
+        last_report_text = txt if len(txt) <= max_chars else (txt[:max_chars] + "\n\n（已截断：完整报告请重新调用 /v3/analysis/overall 获取）")
+    system_prompt = build_chat_system_prompt(
+        as_of_date=str(snapshot.get("date") or ""),
+        prompt_context_text=prompt_context,
+        last_overall_report_text_or_summary=last_report_text,
     )
     
     response: Dict[str, Any] = {
@@ -1875,7 +2271,7 @@ async def chat(req: ChatRequest, auth: Any = Depends(require_auth)) -> Dict[str,
         if reply_text:
             response["reply"] = reply_text
             response["llm_provider"] = "gemini"
-            response["llm_model"] = req.model or GEMINI_DEFAULT_MODEL
+            response["llm_model"] = _normalize_gemini_model_name(req.model)
         else:
             response["reply"] = None
             response["llm_error"] = error
@@ -1886,77 +2282,19 @@ async def chat(req: ChatRequest, auth: Any = Depends(require_auth)) -> Dict[str,
 
 
 def build_llm_prompts(date_str: str, modules: Dict[str, Any], labels: Dict[str, str]) -> Dict[str, str]:
-    """基于 v1/context 的模块数据，生成可直接喂给 LLM 的 system/user 提示词。
+    """兼容旧调用：返回当前“综合专业版”提示词（按钮2）。
 
-    目标：
-    1) 模块内关联 + regime（fundamentals/liquidity/sentiment/technicals）
-    2) 跨模块综合（相关性/驱动/一致性）
-    3) 按固定框架输出整体趋势与风险场景
+    注意：新的按钮2 prompt 已替换为结构化的一致性评分 + 跨资产链条 + 多资产细分框架。
     """
     prompt_context = build_prompt_context(modules, labels)
-
-    system_prompt = (
-        "你是一名买方宏观与跨资产策略分析师。你必须严格基于输入数据推断，"
-        "不得臆造未提供的事实/数值；若数据缺失需明确标注。"
-        "输出需专业、结构化、可执行。"
+    system_prompt = GLOBAL_SYSTEM_PROMPT
+    user_prompt = build_overall_user_prompt(
+        as_of_date=date_str,
+        prompt_context_text=prompt_context,
+        labels=labels,
+        module_reports_or_empty="",
+        supplemental_overall=None,
     )
-
-    # 固定框架（面向 Dify/LLM）：先模块内，再跨模块，最后给出趋势与情景。
-    user_prompt = f"""
-你将获得一份市场快照（时间标签：{date_str}）。请仅基于该快照完成分析。
-
-快照数据（已做必要的数值汇总）：
-{prompt_context}
-
-已给出的 regime 标签：
-- Macro: {labels.get('macro_regime')}
-- Liquidity: {labels.get('liquidity_regime')}
-- Sentiment: {labels.get('sentiment_regime')}
-- Technical: {labels.get('technical_regime')}
-
-请按以下固定框架输出（必须按序、标题一致）：
-
-1) 数据完整性与异常检查
-- 指出缺失项（如 put/call、calendar 403 等）以及这些缺失对结论的影响。
-- 标注你认为最不可信/最需复核的数据点，并说明原因（例如数据源、口径、滞后）。
-
-2) 模块内深度解读（逐模块，强调"内部数据关联" + 与 regime 的一致性）
-2.1 Fundamentals（利率曲线/政策预期/美元/关键宏观事件）
-- 解释 2Y、10Y、期限利差、FFR-2Y 的相互关系（政策 vs 市场定价）。
-- 结合 Real10Y 与 10Y breakeven（若有）判断"实际利率/通胀预期"对美元与黄金的含义。
-- 用 3-5 条要点给出该模块结论，并用一句话判断其对 risk assets 的方向性影响。
-
-2.2 Liquidity（WALCL/RRP/TGA/Net Liquidity、信用条件）
-- 分解 Net Liquidity 的驱动（WALCL、RRP、TGA）与近 4 周变化。
-- 结合信用指标（HYG/IEI 及 OAS 若有）给出资金面/信用面的压力方向。
-
-2.3 Sentiment（FGI/VIX term structure/put-call/风险价差）
-- 检查 FGI、VIX 与 VIX3M 的组合是否一致（例如 contango/ backwardation）。
-- 将 put/call（若有）与其它风险指标交叉验证，指出是否出现"情绪与价格背离"。
-
-2.4 Technicals（趋势/波动/宽度/广度/风格）
-- 基于 MA 距离、ATR%、boll width、trend label 判断"趋势强度 vs 震荡"。
-- 用 breadth（RSP-SPX）与风格比（XLK/XLP）解释市场内部结构（集中度/轮动）。
-
-3) 跨模块综合（相关性/驱动/一致性评分）
-- 用一段话总结：利率/美元/黄金、流动性、情绪、技术面是否"同向确认"还是"相互打架"。
-- 列出 3 条最关键的跨资产链条（例如：Real yields → USD → Gold；Net Liquidity → Equities/Crypto；Curve → Small caps）。
-- 给出一个"regime 一致性评分"（0-100，主观即可），并解释评分依据。
-
-4) 整体趋势判断与场景（专业策略框架）
-- Base case（1-2 周）：给出趋势判断（risk-on/risk-off/震荡）与 2-3 个可观察触发条件。
-- 1-3 个月：给出更中期的主线（政策/增长/通胀/流动性），并指出最大的风险变量。
-- Bull/Bear 备选场景：各写 2-3 条触发条件 + 1 条应对（仓位/对冲/择时原则）。
-
-5) 交易与风控要点（不要求具体标的，但要可执行）
-- 列出 3 条"该做/不该做"的原则（例如追涨/逢低/对冲/杠杆）。
-- 列出 3 个你会重点盯的 next-step 数据或新闻（优先来自 Key events / Top news）。
-
-输出要求：
-- 使用中文；要点化为主，避免空话。
-- 不要引用外部资料；不得补造数据。
-""".strip()
-
     return {"system_prompt": system_prompt, "user_prompt": user_prompt}
 
 
