@@ -102,11 +102,107 @@ APP_PASSWORD = os.getenv("APP_PASSWORD")
 # elsewhere or implement expiry.  Here we keep it simple.
 _sessions: Dict[str, Dict[str, Any]] = {}
 
-# In-memory snapshot cache: maps snapshot_id to a snapshot object.  A snapshot
-# contains the date, modules, labels, signals, heuristic labels and data
-# quality flags.  Snapshots are keyed by a random id so they can be
-# referenced later for LLM analysis without recomputation.
+# In-memory snapshot cache (cache only): maps snapshot_id to a snapshot object.
+# IMPORTANT: The source-of-truth is the filesystem (DATA_DIR). This in-memory
+# dict is only a performance cache for hot snapshots.
 _snapshot_cache: Dict[str, Dict[str, Any]] = {}
+
+#
+# Persistent storage (Render Persistent Disk)
+# - Render 上建议配置 Persistent Disk mount 到 /var/data，然后设置：
+#   DATA_DIR=/var/data
+# - 本地不设置则默认写到项目目录下的 ./data
+#
+DATA_DIR = os.path.abspath(os.getenv("DATA_DIR") or os.path.join(_BASE_DIR, "data"))
+SNAPSHOT_STORE_DIR = os.path.join(DATA_DIR, "snapshots")
+LLM_LOG_DIR = os.path.join(DATA_DIR, "llm_logs")
+
+PERSIST_ENABLED = True
+try:
+    os.makedirs(SNAPSHOT_STORE_DIR, exist_ok=True)
+    os.makedirs(LLM_LOG_DIR, exist_ok=True)
+except Exception as exc:
+    # 若磁盘不可写，降级到内存（仍可跑通，但重启会丢数据）
+    logging.warning("DATA_DIR 不可写，持久化被禁用: %s", exc)
+    PERSIST_ENABLED = False
+
+
+def _atomic_write_json(path: str, obj: Any) -> None:
+    """Write JSON atomically (safe for crash/restart)."""
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def _snapshot_path(snapshot_id: str) -> str:
+    return os.path.join(SNAPSHOT_STORE_DIR, f"{snapshot_id}.json")
+
+
+def _save_snapshot_to_disk(snapshot: Dict[str, Any]) -> None:
+    if not PERSIST_ENABLED:
+        return
+    sid = str(snapshot.get("id") or "").strip()
+    if not sid:
+        return
+    try:
+        snapshot = {**snapshot, "persisted_ts": time.time()}
+        _atomic_write_json(_snapshot_path(sid), snapshot)
+    except Exception as exc:
+        logging.warning("snapshot 落盘失败（sid=%s）: %s", sid, exc)
+
+
+def _load_snapshot_from_disk(snapshot_id: str) -> Optional[Dict[str, Any]]:
+    if not PERSIST_ENABLED:
+        return None
+    path = _snapshot_path(snapshot_id)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        logging.warning("snapshot 读取失败（sid=%s）: %s", snapshot_id, exc)
+        return None
+
+
+def _get_snapshot(snapshot_id: str) -> Optional[Dict[str, Any]]:
+    """Get snapshot by id (memory cache first, then disk)."""
+    snap = _snapshot_cache.get(snapshot_id)
+    if snap:
+        return snap
+    snap = _load_snapshot_from_disk(snapshot_id)
+    if snap:
+        _snapshot_cache[snapshot_id] = snap
+    return snap
+
+
+def _append_jsonl(path: str, record: Dict[str, Any]) -> None:
+    if not PERSIST_ENABLED:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _log_llm_event(kind: str, snapshot_id: str, record: Dict[str, Any], module_name: Optional[str] = None) -> None:
+    """Append an LLM event record to disk (JSONL)."""
+    if not PERSIST_ENABLED:
+        return
+    sid = (snapshot_id or "").strip()
+    if not sid:
+        return
+    try:
+        base = os.path.join(LLM_LOG_DIR, kind, sid)
+        if module_name:
+            path = os.path.join(base, f"{module_name}.jsonl")
+        else:
+            path = os.path.join(base, "events.jsonl")
+        record = {"ts": time.time(), **record}
+        _append_jsonl(path, record)
+    except Exception as exc:
+        logging.warning("LLM log 失败(kind=%s sid=%s): %s", kind, snapshot_id, exc)
 
 
 FRED_API_KEY = os.getenv("FRED_API_KEY")
@@ -246,12 +342,14 @@ def build_module_user_prompt(
             "Fear&Greed（FGI）",
             "VIX 期限结构（VIX vs VIX3M / contango/backwardation）",
             "Put/Call（或其均值）",
+            "市场广度（涨跌家数比 A/D Ratio、新高新低比；若有）",
             "交叉验证（风险价差 SPY-XLU / HYG-IEF / BTC-Gold 之一；缺失则 NA）",
         ],
         "technicals": [
             "趋势（MA20/50/200 距离 + trend_label）",
             "波动/结构（ATR%、boll_width）",
             "广度（RSP-SPX）",
+            "期权指标（SPY期权PCR成交量/OI、IV偏斜；若有）",
             "交叉验证（风格比 XLK/XLP 或相关；缺失则 NA）",
         ],
     }
@@ -671,8 +769,8 @@ CBOE_PCR_URLS = {
 }
 
 DEFAULT_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-TE_CACHE_PATH = os.getenv("TE_CACHE_PATH", "cache_te_calendar.json")
-TE_CIRCUIT_PATH = os.getenv("TE_CIRCUIT_PATH", "cache_te_circuit.json")
+TE_CACHE_PATH = os.getenv("TE_CACHE_PATH") or os.path.join(DATA_DIR, "cache_te_calendar.json")
+TE_CIRCUIT_PATH = os.getenv("TE_CIRCUIT_PATH") or os.path.join(DATA_DIR, "cache_te_circuit.json")
 
 # -------- TradingEconomics helpers --------
 def te_credential_string() -> str:
@@ -913,6 +1011,176 @@ def build_events_fred(timeout: int = 15) -> List[Dict[str, Any]]:
         if d:
             events.append({"event": item["name"], "last_release_date": d, "source": "FRED"})
     return events
+
+
+# -------- Investing.com Economic Calendar --------
+def get_investing_calendar_events(
+    country: str = "united states",
+    lookback_days: int = 1,
+    lookforward_days: int = 7,
+    timeout: int = 20,
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """
+    从Investing.com经济日历获取事件数据。
+    使用POST请求调用其内部API获取数据。
+    
+    Returns:
+        Tuple[List[Dict], Optional[str]]: (事件列表, 备注信息)
+    """
+    try:
+        from datetime import datetime, timedelta
+        
+        # 计算日期范围
+        today = datetime.now()
+        date_from = (today - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+        date_to = (today + timedelta(days=lookforward_days)).strftime("%Y-%m-%d")
+        
+        # Investing.com AJAX API endpoint
+        url = "https://www.investing.com/economic-calendar/Service/getCalendarFilteredData"
+        
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "X-Requested-With": "XMLHttpRequest",
+            "Origin": "https://www.investing.com",
+            "Referer": "https://www.investing.com/economic-calendar/",
+        }
+        
+        # 国家ID映射 (Investing.com内部ID)
+        country_ids = {
+            "united states": "5",
+            "usa": "5",
+            "us": "5",
+        }
+        country_id = country_ids.get(country.lower(), "5")
+        
+        # POST数据
+        data = {
+            "country[]": country_id,
+            "dateFrom": date_from,
+            "dateTo": date_to,
+            "timeZone": "8",  # UTC+8，可根据需要调整
+            "timeFilter": "timeRemain",
+            "currentTab": "today",
+            "submitFilters": "1",
+            "limit_from": "0",
+        }
+        
+        r = requests.post(url, headers=headers, data=data, timeout=timeout)
+        
+        if r.status_code != 200:
+            return [], f"Investing.com API returned status {r.status_code}"
+        
+        # 解析JSON响应
+        try:
+            resp = r.json()
+            html_data = resp.get("data", "")
+        except:
+            html_data = r.text
+        
+        # 解析HTML表格数据
+        events = _parse_investing_calendar_html(html_data, country)
+        
+        if events:
+            return events, "Investing.com Economic Calendar"
+        else:
+            return [], "Investing.com: No events found or parsing failed"
+            
+    except requests.exceptions.Timeout:
+        return [], "Investing.com calendar request timed out"
+    except requests.exceptions.RequestException as e:
+        return [], f"Investing.com calendar request failed: {str(e)}"
+    except Exception as e:
+        logging.warning("Investing.com calendar error: %s", e)
+        return [], f"Investing.com calendar error: {str(e)}"
+
+
+def _parse_investing_calendar_html(html: str, country_filter: str = "united states") -> List[Dict[str, Any]]:
+    """
+    解析Investing.com经济日历的HTML数据。
+    
+    Args:
+        html: HTML字符串（AJAX返回的数据）
+        country_filter: 国家过滤器
+    
+    Returns:
+        事件列表
+    """
+    import re
+    events: List[Dict[str, Any]] = []
+    
+    if not html:
+        return events
+    
+    try:
+        # 查找所有事件行
+        rows = re.findall(r'<tr[^>]*eventRowId[^>]*>(.*?)</tr>', html, re.DOTALL)
+        
+        for row in rows:
+            event = _extract_investing_event(row)
+            if event:
+                events.append(event)
+        
+    except Exception as e:
+        logging.warning("Failed to parse Investing.com calendar HTML: %s", e)
+    
+    return events
+
+
+def _extract_investing_event(row_html: str) -> Optional[Dict[str, Any]]:
+    """从Investing.com的单个HTML行提取事件信息"""
+    import re
+    
+    event: Dict[str, Any] = {"source": "Investing.com", "country": "United States"}
+    
+    # 提取事件名称 - 查找event链接中的文本
+    # 格式: <a href="/economic-calendar/xxx">Event Name</a>
+    event_link_match = re.search(r'href="/economic-calendar/[^"]*"[^>]*>([^<]+)</a>', row_html)
+    if event_link_match:
+        event['event'] = event_link_match.group(1).strip()
+    else:
+        return None  # 没有事件名称则跳过
+    
+    # 提取时间
+    time_match = re.search(r'class="[^"]*time[^"]*"[^>]*>([^<]+)</td>', row_html)
+    if time_match:
+        event['time'] = time_match.group(1).strip()
+    
+    # 提取日期时间属性
+    datetime_match = re.search(r'data-event-datetime="([^"]+)"', row_html)
+    if datetime_match:
+        event['datetime'] = datetime_match.group(1)
+    
+    # 提取重要性（星星数量 - 计算grayFullBullishIcon的数量）
+    bull_count = len(re.findall(r'grayFullBullishIcon', row_html))
+    event['importance'] = bull_count if bull_count > 0 else 1
+    
+    # 提取actual值
+    actual_match = re.search(r'class="[^"]*\bact\b[^"]*"[^>]*>([^<]*)</td>', row_html, re.IGNORECASE)
+    if actual_match:
+        val = actual_match.group(1).strip()
+        event['actual'] = val if val and val != '&nbsp;' else None
+    
+    # 提取forecast值
+    forecast_match = re.search(r'class="[^"]*\bfore\b[^"]*"[^>]*>([^<]*)</td>', row_html, re.IGNORECASE)
+    if forecast_match:
+        val = forecast_match.group(1).strip()
+        event['forecast'] = val if val and val != '&nbsp;' else None
+    
+    # 提取previous值 - 可能在<span>中
+    prev_match = re.search(r'class="[^"]*\bprev\b[^"]*"[^>]*>(?:<span[^>]*>)?([^<]*)(?:</span>)?</td>', row_html, re.IGNORECASE)
+    if prev_match:
+        val = prev_match.group(1).strip()
+        event['previous'] = val if val and val != '&nbsp;' else None
+    
+    # 提取重要性描述
+    importance_match = re.search(r'title="((?:Low|Moderate|High)[^"]*Volatility[^"]*)"', row_html)
+    if importance_match:
+        event['importance_desc'] = importance_match.group(1)
+    
+    return event if event.get('event') else None
 
 
 # -------- CBOE PCR helpers --------
@@ -1422,6 +1690,252 @@ def _extract_put_call_ratio(df: pd.DataFrame) -> Optional[float]:
     return None
 
 
+# -----------------------------------------------------------------------------
+# 市场广度数据获取 - WSJ Market Breadth (动态页面，需要JavaScript渲染)
+# -----------------------------------------------------------------------------
+def fetch_market_breadth(timeout: int = 15) -> Dict[str, Any]:
+    """
+    尝试从WSJ网页抓取NYSE/NASDAQ的涨跌家数、新高新低等市场广度数据。
+    
+    注意: WSJ页面使用JavaScript动态渲染，静态请求可能无法获取完整数据。
+    当无法获取时，系统会使用RSP-SPX差异作为广度代理指标。
+    
+    数据来源: https://www.wsj.com/market-data/stocks/us
+    
+    Returns:
+        Dict包含:
+        - nyse_advancing: NYSE上涨家数
+        - nyse_declining: NYSE下跌家数
+        - nasdaq_advancing: NASDAQ上涨家数
+        - nasdaq_declining: NASDAQ下跌家数
+        - nyse_new_highs: NYSE新高数量
+        - nyse_new_lows: NYSE新低数量
+        - nasdaq_new_highs: NASDAQ新高数量
+        - nasdaq_new_lows: NASDAQ新低数量
+        - advance_decline_ratio: 综合涨跌比
+        - new_high_low_ratio: 新高新低比
+        - breadth_source: 数据来源
+        - breadth_note: 备注信息
+    """
+    import re
+    
+    result: Dict[str, Any] = {
+        "nyse_advancing": None,
+        "nyse_declining": None,
+        "nasdaq_advancing": None,
+        "nasdaq_declining": None,
+        "nyse_new_highs": None,
+        "nyse_new_lows": None,
+        "nasdaq_new_highs": None,
+        "nasdaq_new_lows": None,
+        "advance_decline_ratio": None,
+        "new_high_low_ratio": None,
+        "breadth_source": None,
+        "breadth_note": None,
+    }
+    
+    try:
+        # WSJ页面是动态渲染的，尝试获取可能的静态数据
+        url = "https://www.wsj.com/market-data/stocks/us"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        
+        r = requests.get(url, headers=headers, timeout=timeout)
+        r.raise_for_status()
+        html = r.text
+        
+        def parse_num(s: str) -> Optional[int]:
+            if not s:
+                return None
+            try:
+                return int(s.replace(",", "").strip())
+            except ValueError:
+                return None
+        
+        # 尝试解析动态渲染前可能存在的数据
+        # 注意：这些正则可能需要根据WSJ页面结构变化而更新
+        
+        # 尝试从JSON数据中提取（如果存在）
+        json_patterns = [
+            r'"issuesAdvancing"\s*:\s*(\d+)',
+            r'"issuesDeclining"\s*:\s*(\d+)',
+            r'"newHighs"\s*:\s*(\d+)',
+            r'"newLows"\s*:\s*(\d+)',
+        ]
+        
+        for pattern in json_patterns:
+            match = re.search(pattern, html, re.IGNORECASE)
+            if match:
+                if 'advancing' in pattern.lower():
+                    result["nyse_advancing"] = parse_num(match.group(1))
+                elif 'declining' in pattern.lower():
+                    result["nyse_declining"] = parse_num(match.group(1))
+                elif 'highs' in pattern.lower():
+                    result["nyse_new_highs"] = parse_num(match.group(1))
+                elif 'lows' in pattern.lower():
+                    result["nyse_new_lows"] = parse_num(match.group(1))
+        
+        # 计算综合指标
+        total_adv = (result["nyse_advancing"] or 0) + (result["nasdaq_advancing"] or 0)
+        total_dec = (result["nyse_declining"] or 0) + (result["nasdaq_declining"] or 0)
+        if total_adv > 0 and total_dec > 0:
+            result["advance_decline_ratio"] = round(total_adv / total_dec, 3)
+        
+        total_nh = (result["nyse_new_highs"] or 0) + (result["nasdaq_new_highs"] or 0)
+        total_nl = (result["nyse_new_lows"] or 0) + (result["nasdaq_new_lows"] or 0)
+        if total_nh >= 0 and total_nl > 0:
+            result["new_high_low_ratio"] = round(total_nh / total_nl, 3)
+        elif total_nh > 0 and total_nl == 0:
+            result["new_high_low_ratio"] = float("inf")
+        
+        # 检查是否获取到有效数据
+        if result["nyse_advancing"] is None and result["nasdaq_advancing"] is None:
+            result["breadth_source"] = "RSP-SPX proxy"
+            result["breadth_note"] = "WSJ requires JavaScript; using RSP-SPX spread as breadth proxy"
+        else:
+            result["breadth_source"] = "WSJ Market Data"
+        
+    except requests.exceptions.Timeout:
+        result["breadth_source"] = "RSP-SPX proxy"
+        result["breadth_note"] = "WSJ timeout; using RSP-SPX spread as breadth proxy"
+    except requests.exceptions.RequestException as e:
+        result["breadth_source"] = "RSP-SPX proxy"
+        result["breadth_note"] = f"WSJ unavailable; using RSP-SPX spread as breadth proxy"
+    except Exception as e:
+        logging.warning("WSJ market breadth error: %s", e)
+        result["breadth_source"] = "RSP-SPX proxy"
+        result["breadth_note"] = f"WSJ error; using RSP-SPX spread as breadth proxy"
+    
+    return result
+
+
+# -----------------------------------------------------------------------------
+# SPY期权数据获取 - 使用yfinance
+# -----------------------------------------------------------------------------
+def fetch_spy_options_metrics(timeout: int = 30) -> Dict[str, Any]:
+    """
+    使用yfinance获取SPY期权链数据，计算期权市场情绪指标。
+    
+    数据来源: Yahoo Finance Options Chain
+    
+    Returns:
+        Dict包含:
+        - options_pcr_volume: 期权成交量看跌/看涨比率
+        - options_pcr_oi: 期权未平仓合约看跌/看涨比率
+        - total_call_volume: 看涨期权总成交量
+        - total_put_volume: 看跌期权总成交量
+        - total_call_oi: 看涨期权总未平仓合约
+        - total_put_oi: 看跌期权总未平仓合约
+        - atm_iv_call: 平价看涨期权隐含波动率
+        - atm_iv_put: 平价看跌期权隐含波动率
+        - iv_skew: 隐含波动率偏斜 (put IV - call IV)
+        - near_expiry: 最近到期日
+        - options_source: 数据来源
+        - options_note: 备注信息
+    """
+    result: Dict[str, Any] = {
+        "options_pcr_volume": None,
+        "options_pcr_oi": None,
+        "total_call_volume": None,
+        "total_put_volume": None,
+        "total_call_oi": None,
+        "total_put_oi": None,
+        "atm_iv_call": None,
+        "atm_iv_put": None,
+        "iv_skew": None,
+        "near_expiry": None,
+        "options_source": None,
+        "options_note": None,
+    }
+    
+    try:
+        spy = yf.Ticker("SPY")
+        
+        # 获取当前价格
+        hist = spy.history(period="1d")
+        if hist.empty:
+            result["options_note"] = "Failed to get SPY current price"
+            return result
+        current_price = hist["Close"].iloc[-1]
+        
+        # 获取可用的到期日
+        expirations = spy.options
+        if not expirations:
+            result["options_note"] = "No SPY options expirations available"
+            return result
+        
+        # 选择最近的2-3个到期日来计算综合指标
+        near_expirations = list(expirations[:3])
+        result["near_expiry"] = near_expirations[0] if near_expirations else None
+        
+        total_call_vol = 0
+        total_put_vol = 0
+        total_call_oi = 0
+        total_put_oi = 0
+        atm_calls = []
+        atm_puts = []
+        
+        for exp in near_expirations:
+            try:
+                opt_chain = spy.option_chain(exp)
+                calls = opt_chain.calls
+                puts = opt_chain.puts
+                
+                # 累加成交量和未平仓合约
+                total_call_vol += calls["volume"].sum() if "volume" in calls else 0
+                total_put_vol += puts["volume"].sum() if "volume" in puts else 0
+                total_call_oi += calls["openInterest"].sum() if "openInterest" in calls else 0
+                total_put_oi += puts["openInterest"].sum() if "openInterest" in puts else 0
+                
+                # 找到最接近当前价格的行权价（ATM）
+                if not calls.empty and "strike" in calls and "impliedVolatility" in calls:
+                    calls_atm = calls.iloc[(calls["strike"] - current_price).abs().argsort()[:1]]
+                    if not calls_atm.empty and not pd.isna(calls_atm["impliedVolatility"].iloc[0]):
+                        atm_calls.append(calls_atm["impliedVolatility"].iloc[0])
+                
+                if not puts.empty and "strike" in puts and "impliedVolatility" in puts:
+                    puts_atm = puts.iloc[(puts["strike"] - current_price).abs().argsort()[:1]]
+                    if not puts_atm.empty and not pd.isna(puts_atm["impliedVolatility"].iloc[0]):
+                        atm_puts.append(puts_atm["impliedVolatility"].iloc[0])
+                        
+            except Exception as e:
+                logging.warning("Failed to fetch SPY options for %s: %s", exp, e)
+                continue
+        
+        # 计算指标
+        result["total_call_volume"] = int(total_call_vol) if total_call_vol > 0 else None
+        result["total_put_volume"] = int(total_put_vol) if total_put_vol > 0 else None
+        result["total_call_oi"] = int(total_call_oi) if total_call_oi > 0 else None
+        result["total_put_oi"] = int(total_put_oi) if total_put_oi > 0 else None
+        
+        # PCR (Put/Call Ratio)
+        if total_call_vol > 0:
+            result["options_pcr_volume"] = round(total_put_vol / total_call_vol, 3)
+        if total_call_oi > 0:
+            result["options_pcr_oi"] = round(total_put_oi / total_call_oi, 3)
+        
+        # ATM隐含波动率
+        if atm_calls:
+            result["atm_iv_call"] = round(sum(atm_calls) / len(atm_calls), 4)
+        if atm_puts:
+            result["atm_iv_put"] = round(sum(atm_puts) / len(atm_puts), 4)
+        
+        # IV偏斜 (Put IV - Call IV)
+        if result["atm_iv_put"] is not None and result["atm_iv_call"] is not None:
+            result["iv_skew"] = round(result["atm_iv_put"] - result["atm_iv_call"], 4)
+        
+        result["options_source"] = "Yahoo Finance SPY Options"
+        
+    except Exception as e:
+        logging.warning("SPY options metrics error: %s", e)
+        result["options_note"] = f"SPY options error: {str(e)}"
+    
+    return result
+
+
 def _fetch_fear_greed() -> Tuple[Optional[int], Optional[str], Optional[str]]:
     """优先使用 fear-greed-index 包，失败则调用 CNN API。"""
     try:
@@ -1470,6 +1984,12 @@ def fetch_fundamentals(date_str: str) -> Dict[str, Any]:
         "ffr_minus_2y": None,
         "fedfunds_date": None,
         "ffr_minus_2y_note": None,
+        # 新增：实际利率与通胀预期
+        "real10y": None,
+        "breakeven10y": None,
+        # 新增：信用利差OAS
+        "ig_oas": None,
+        "hy_oas": None,
     }
     if fred_client:
         try:
@@ -1481,6 +2001,34 @@ def fetch_fundamentals(date_str: str) -> Dict[str, Any]:
                 rates["term_spread"] = rates["dgs10"] - rates["dgs2"]
         except Exception as exc:
             logging.warning("Failed to fetch FRED rates: %s", exc)
+        
+        # 获取10年期实际利率 (TIPS收益率) - FRED: DFII10
+        try:
+            real10y_series = fred_client.get_series("DFII10", start, target)
+            rates["real10y"] = _safe_asof(real10y_series, target)
+        except Exception as exc:
+            logging.warning("Failed to fetch FRED DFII10 (real10y): %s", exc)
+        
+        # 获取10年期盈亏平衡通胀率 - FRED: T10YIE
+        try:
+            breakeven_series = fred_client.get_series("T10YIE", start, target)
+            rates["breakeven10y"] = _safe_asof(breakeven_series, target)
+        except Exception as exc:
+            logging.warning("Failed to fetch FRED T10YIE (breakeven10y): %s", exc)
+        
+        # 获取投资级债券OAS利差 - FRED: BAMLC0A0CM (ICE BofA US Corporate Index OAS)
+        try:
+            ig_oas_series = fred_client.get_series("BAMLC0A0CM", start, target)
+            rates["ig_oas"] = _safe_asof(ig_oas_series, target)
+        except Exception as exc:
+            logging.warning("Failed to fetch FRED BAMLC0A0CM (ig_oas): %s", exc)
+        
+        # 获取高收益债券OAS利差 - FRED: BAMLH0A0HYM2 (ICE BofA US High Yield Index OAS)
+        try:
+            hy_oas_series = fred_client.get_series("BAMLH0A0HYM2", start, target)
+            rates["hy_oas"] = _safe_asof(hy_oas_series, target)
+        except Exception as exc:
+            logging.warning("Failed to fetch FRED BAMLH0A0HYM2 (hy_oas): %s", exc)
 
     # Fed Funds：优先 EFFR，再退 FEDFUNDS，取最近一次有效值
     effr, _ = fred_latest_observation("EFFR")
@@ -1506,18 +2054,28 @@ def fetch_fundamentals(date_str: str) -> Dict[str, Any]:
         ["DX-Y.NYB", "DXY", "USDOLLAR"], target, start, target + timedelta(days=1)
     )
 
-    events, events_note = get_te_calendar_events(
-        countries=("united states",), lookback_days=7, lookforward_days=7, importance_min=2
+    # 优先使用 Investing.com 经济日历
+    events, events_note = get_investing_calendar_events(
+        country="united states", lookback_days=1, lookforward_days=7
     )
-    # 如果 TE 不可用，则尝试 FRED release dates 作为弱替代
+    
+    # 如果 Investing.com 不可用，尝试 TradingEconomics 作为备选
     if not events:
-        fred_events = build_events_fred()
-        if fred_events:
-            events = fred_events
-            if events_note:
-                events_note += " | Fallback to FRED releases."
-            else:
-                events_note = "Fallback to FRED releases."
+        te_events, te_note = get_te_calendar_events(
+            countries=("united states",), lookback_days=7, lookforward_days=7, importance_min=2
+        )
+        if te_events:
+            events = te_events
+            events_note = te_note
+        else:
+            # 最终回退到 FRED release dates
+            fred_events = build_events_fred()
+            if fred_events:
+                events = fred_events
+                if events_note:
+                    events_note += " | Fallback to FRED releases."
+                else:
+                    events_note = "Fallback to FRED releases."
 
     news: List[Dict[str, Any]] = []
     try:
@@ -1593,7 +2151,7 @@ def fetch_liquidity(date_str: str) -> Dict[str, Any]:
 
 
 def fetch_sentiment(date_str: str) -> Dict[str, Any]:
-    """情绪相关指标：Fear & Greed、VIX 期限结构、PCR、风险偏好价差。"""
+    """情绪相关指标：Fear & Greed、VIX 期限结构、PCR、风险偏好价差、市场广度。"""
     target = pd.to_datetime(date_str)
 
     fgi_score, fgi_rating, fgi_source = _fetch_fear_greed()
@@ -1640,6 +2198,9 @@ def fetch_sentiment(date_str: str) -> Dict[str, Any]:
         if not returns.empty and lhs in returns and rhs in returns:
             spreads[name] = _safe_asof(returns[lhs] - returns[rhs], target)
 
+    # 获取市场广度数据（涨跌家数、新高新低）
+    breadth = fetch_market_breadth()
+
     return {
         "fgi_score": fgi_score,
         "fgi_rating": fgi_rating,
@@ -1655,6 +2216,19 @@ def fetch_sentiment(date_str: str) -> Dict[str, Any]:
         "put_call_date": pcr.get("put_call_date"),
         "put_call_note": pcr.get("put_call_note"),
         "put_call_url": pcr.get("put_call_url"),
+        # 市场广度数据
+        "nyse_advancing": breadth.get("nyse_advancing"),
+        "nyse_declining": breadth.get("nyse_declining"),
+        "nasdaq_advancing": breadth.get("nasdaq_advancing"),
+        "nasdaq_declining": breadth.get("nasdaq_declining"),
+        "nyse_new_highs": breadth.get("nyse_new_highs"),
+        "nyse_new_lows": breadth.get("nyse_new_lows"),
+        "nasdaq_new_highs": breadth.get("nasdaq_new_highs"),
+        "nasdaq_new_lows": breadth.get("nasdaq_new_lows"),
+        "advance_decline_ratio": breadth.get("advance_decline_ratio"),
+        "new_high_low_ratio": breadth.get("new_high_low_ratio"),
+        "breadth_source": breadth.get("breadth_source"),
+        "breadth_note": breadth.get("breadth_note"),
         **spreads,
     }
 
@@ -1691,7 +2265,7 @@ def _calc_indicators(series: pd.Series, target: pd.Timestamp) -> Dict[str, Any]:
 
 
 def fetch_technicals(date_str: str) -> Dict[str, Any]:
-    """技术面指标：主流指数/商品/加密的均线距离、ATR、布林带宽度等。"""
+    """技术面指标：主流指数/商品/加密的均线距离、ATR、布林带宽度、期权指标等。"""
     target = pd.to_datetime(date_str)
     assets = {
         "SPX": "^GSPC",
@@ -1720,7 +2294,27 @@ def fetch_technicals(date_str: str) -> Dict[str, Any]:
     if not hist.empty and {"XLK", "XLP"} <= set(hist.columns):
         style_ratio = _safe_asof(hist["XLK"] / hist["XLP"], target)
 
-    return {"assets": technicals, "breadth_diff": breadth_diff, "style_ratio": style_ratio}
+    # 获取SPY期权数据作为技术面补充
+    spy_options = fetch_spy_options_metrics()
+
+    return {
+        "assets": technicals,
+        "breadth_diff": breadth_diff,
+        "style_ratio": style_ratio,
+        # SPY期权指标
+        "options_pcr_volume": spy_options.get("options_pcr_volume"),
+        "options_pcr_oi": spy_options.get("options_pcr_oi"),
+        "total_call_volume": spy_options.get("total_call_volume"),
+        "total_put_volume": spy_options.get("total_put_volume"),
+        "total_call_oi": spy_options.get("total_call_oi"),
+        "total_put_oi": spy_options.get("total_put_oi"),
+        "atm_iv_call": spy_options.get("atm_iv_call"),
+        "atm_iv_put": spy_options.get("atm_iv_put"),
+        "iv_skew": spy_options.get("iv_skew"),
+        "near_expiry": spy_options.get("near_expiry"),
+        "options_source": spy_options.get("options_source"),
+        "options_note": spy_options.get("options_note"),
+    }
 
 
 def assign_labels(modules: Dict[str, Any]) -> Dict[str, str]:
@@ -1753,24 +2347,67 @@ def assign_labels(modules: Dict[str, Any]) -> Dict[str, str]:
 
     fgi_score = sentiment.get("fgi_score")
     vix = sentiment.get("vix") or 0
+    ad_ratio = sentiment.get("advance_decline_ratio")  # 涨跌家数比
+    nh_nl_ratio = sentiment.get("new_high_low_ratio")  # 新高新低比
+    
+    # 计算广度得分作为辅助判断
+    breadth_bullish = 0
+    if ad_ratio is not None:
+        if ad_ratio > 1.5:
+            breadth_bullish += 1
+        elif ad_ratio < 0.67:
+            breadth_bullish -= 1
+    if nh_nl_ratio is not None:
+        if nh_nl_ratio > 2:
+            breadth_bullish += 1
+        elif nh_nl_ratio < 0.5:
+            breadth_bullish -= 1
+    
     if fgi_score is None:
         labels["sentiment_regime"] = "Unknown"
     elif fgi_score >= 60 and vix < 20:
         labels["sentiment_regime"] = "Greed"
     elif fgi_score <= 40 or vix > 25:
         labels["sentiment_regime"] = "Fear"
+    elif breadth_bullish >= 2:
+        labels["sentiment_regime"] = "Greed"  # 广度强劲支持贪婪
+    elif breadth_bullish <= -2:
+        labels["sentiment_regime"] = "Fear"  # 广度疲弱支持恐惧
     else:
         labels["sentiment_regime"] = "Neutral"
 
     spx = technicals.get("SPX", {})
     trend = spx.get("trend_label")
     boll = spx.get("boll_width")
+    
+    # 获取技术面模块根级数据（期权数据）
+    tech_module = modules.get("technicals", {})
+    iv_skew = tech_module.get("iv_skew")  # 期权隐含波动率偏斜
+    options_pcr_oi = tech_module.get("options_pcr_oi")  # 期权未平仓PCR
+    
     if trend is None:
         labels["technical_regime"] = "Unknown"
     elif trend in {"uptrend", "downtrend"} and boll and boll > 0.04:
         labels["technical_regime"] = "Trending"
     else:
         labels["technical_regime"] = "Range"
+    
+    # 添加期权情绪作为辅助标签（可选）
+    if options_pcr_oi is not None:
+        if options_pcr_oi > 1.2:
+            labels["options_sentiment"] = "Bearish"
+        elif options_pcr_oi < 0.8:
+            labels["options_sentiment"] = "Bullish"
+        else:
+            labels["options_sentiment"] = "Neutral"
+    
+    if iv_skew is not None:
+        if iv_skew > 0.05:
+            labels["iv_skew_signal"] = "Put_Heavy"  # 看跌期权IV偏高，可能是对冲需求
+        elif iv_skew < -0.02:
+            labels["iv_skew_signal"] = "Call_Heavy"  # 看涨期权IV偏高
+        else:
+            labels["iv_skew_signal"] = "Balanced"
 
     return labels
 
@@ -1866,6 +2503,9 @@ def compute_signals(modules: Dict[str, Any], labels: Dict[str, str]) -> Tuple[Di
         "spy_xlu",
         "hyg_ief",
         "btc_gold",
+        # 市场广度数据
+        "advance_decline_ratio",
+        "new_high_low_ratio",
     ]
     sent_signals: List[Dict[str, Any]] = []
     sent_missing: List[str] = []
@@ -1875,6 +2515,19 @@ def compute_signals(modules: Dict[str, Any], labels: Dict[str, str]) -> Tuple[Di
         sent_signals.append({"name": k, "value": val, "quality": quality})
         if val is None:
             sent_missing.append(k)
+    # 添加详细的涨跌家数数据作为补充信号
+    breadth_detail = {
+        "nyse_adv": sent.get("nyse_advancing"),
+        "nyse_dec": sent.get("nyse_declining"),
+        "nasdaq_adv": sent.get("nasdaq_advancing"),
+        "nasdaq_dec": sent.get("nasdaq_declining"),
+        "nyse_new_highs": sent.get("nyse_new_highs"),
+        "nyse_new_lows": sent.get("nyse_new_lows"),
+        "nasdaq_new_highs": sent.get("nasdaq_new_highs"),
+        "nasdaq_new_lows": sent.get("nasdaq_new_lows"),
+    }
+    if any(v is not None for v in breadth_detail.values()):
+        sent_signals.append({"name": "market_breadth_detail", "value": breadth_detail, "quality": "good"})
     signals["sentiment"] = sent_signals
     data_quality["sentiment"] = sent_missing
     heuristics["sentiment"] = labels.get("sentiment_regime", "Unknown")
@@ -1911,6 +2564,33 @@ def compute_signals(modules: Dict[str, Any], labels: Dict[str, str]) -> Tuple[Di
         tech_missing.append("breadth_diff")
     if tech.get("style_ratio") is None:
         tech_missing.append("style_ratio")
+    
+    # 添加SPY期权数据作为技术面补充
+    options_keys = [
+        "options_pcr_volume",
+        "options_pcr_oi",
+        "atm_iv_call",
+        "atm_iv_put",
+        "iv_skew",
+    ]
+    for k in options_keys:
+        val = tech.get(k)
+        quality = "good" if val is not None else "missing"
+        tech_signals.append({"name": k, "value": val, "quality": quality})
+        if val is None:
+            tech_missing.append(k)
+    
+    # 添加详细的期权数据
+    options_detail = {
+        "total_call_volume": tech.get("total_call_volume"),
+        "total_put_volume": tech.get("total_put_volume"),
+        "total_call_oi": tech.get("total_call_oi"),
+        "total_put_oi": tech.get("total_put_oi"),
+        "near_expiry": tech.get("near_expiry"),
+    }
+    if any(v is not None for v in options_detail.values()):
+        tech_signals.append({"name": "spy_options_detail", "value": options_detail, "quality": "good"})
+    
     signals["technicals"] = tech_signals
     data_quality["technicals"] = tech_missing
     heuristics["technicals"] = labels.get("technical_regime", "Unknown")
@@ -1987,12 +2667,12 @@ async def run_snapshot(
     date: Optional[str] = Query(None, description="YYYY-MM-DD, default today"),
     auth: Any = Depends(require_auth),
 ) -> Dict[str, Any]:
-    """Generate a market snapshot for the given date and cache it.
+    """Generate a market snapshot for the given date and persist it.
 
     This endpoint triggers data collection for fundamentals, liquidity,
     sentiment and technicals for the specified date.  It also computes
     heuristic labels and lightweight signal summaries.  The resulting
-    snapshot is stored in memory and can be retrieved via `/v3/snapshot/{id}`.
+    snapshot is stored on disk (DATA_DIR) and can be retrieved via `/v3/snapshot/{id}`.
     """
     target_date = _parse_date(date)
     date_str = target_date.isoformat()
@@ -2018,20 +2698,22 @@ async def run_snapshot(
     snapshot = {
         "id": snapshot_id,
         "date": date_str,
+        "created_ts": time.time(),
         "modules": modules,
         "labels": labels,
         "signals": signals,
         "heuristics": heuristics_by_module,
         "data_quality": data_quality,
     }
-    _snapshot_cache[snapshot_id] = snapshot
+    _save_snapshot_to_disk(snapshot)
+    _snapshot_cache[snapshot_id] = snapshot  # memory cache
     return snapshot
 
 
 @app.get("/v3/snapshot/{snapshot_id}")
 async def get_snapshot(snapshot_id: str, auth: Any = Depends(require_auth)) -> Dict[str, Any]:
     """Return a previously generated snapshot by id."""
-    snapshot = _snapshot_cache.get(snapshot_id)
+    snapshot = _get_snapshot(snapshot_id)
     if not snapshot:
         raise HTTPException(status_code=404, detail="Snapshot not found")
     return snapshot
@@ -2059,7 +2741,7 @@ async def analyse_module(req: ModuleAnalysisRequest, auth: Any = Depends(require
     - module: 模块名称（fundamentals/liquidity/sentiment/technicals）
     - call_llm: 是否调用 LLM（默认 True）
     """
-    snapshot = _snapshot_cache.get(req.snapshot_id)
+    snapshot = _get_snapshot(req.snapshot_id)
     if not snapshot:
         raise HTTPException(status_code=404, detail="Snapshot not found")
     module_name = req.module.lower()
@@ -2105,9 +2787,32 @@ async def analyse_module(req: ModuleAnalysisRequest, auth: Any = Depends(require
                 }
             except Exception:
                 pass
+            _save_snapshot_to_disk(snapshot)
+            _log_llm_event(
+                kind="module",
+                snapshot_id=req.snapshot_id,
+                module_name=module_name,
+                record={
+                    "model": response["llm_model"],
+                    "system_prompt": system_prompt,
+                    "user_prompt": user_prompt,
+                    "analysis": analysis_text,
+                },
+            )
         else:
             response["analysis"] = None
             response["llm_error"] = error
+            _log_llm_event(
+                kind="module",
+                snapshot_id=req.snapshot_id,
+                module_name=module_name,
+                record={
+                    "model": _normalize_gemini_model_name(req.model),
+                    "system_prompt": system_prompt,
+                    "user_prompt": user_prompt,
+                    "error": error,
+                },
+            )
     
     return response
 
@@ -2134,7 +2839,7 @@ async def analyse_overall(req: OverallAnalysisRequest, auth: Any = Depends(requi
     - call_llm: 是否调用 LLM（默认 True）
     - include_module_summaries: 是否包含模块级别的信号/启发式标签/数据质量信息
     """
-    snapshot = _snapshot_cache.get(req.snapshot_id)
+    snapshot = _get_snapshot(req.snapshot_id)
     if not snapshot:
         raise HTTPException(status_code=404, detail="Snapshot not found")
     modules = snapshot["modules"]
@@ -2205,9 +2910,30 @@ async def analyse_overall(req: OverallAnalysisRequest, auth: Any = Depends(requi
                 snapshot["last_overall_report_ts"] = time.time()
             except Exception:
                 pass
+            _save_snapshot_to_disk(snapshot)
+            _log_llm_event(
+                kind="overall",
+                snapshot_id=req.snapshot_id,
+                record={
+                    "model": response["llm_model"],
+                    "system_prompt": system_prompt,
+                    "user_prompt": user_prompt,
+                    "analysis": analysis_text,
+                },
+            )
         else:
             response["analysis"] = None
             response["llm_error"] = error
+            _log_llm_event(
+                kind="overall",
+                snapshot_id=req.snapshot_id,
+                record={
+                    "model": _normalize_gemini_model_name(req.model),
+                    "system_prompt": system_prompt,
+                    "user_prompt": user_prompt,
+                    "error": error,
+                },
+            )
     
     return response
 
@@ -2236,7 +2962,7 @@ async def chat(req: ChatRequest, auth: Any = Depends(require_auth)) -> Dict[str,
     - reply: LLM 回复内容
     - llm_provider/llm_model: LLM 提供商和模型信息
     """
-    snapshot = _snapshot_cache.get(req.snapshot_id)
+    snapshot = _get_snapshot(req.snapshot_id)
     if not snapshot:
         raise HTTPException(status_code=404, detail="Snapshot not found")
     
@@ -2272,9 +2998,29 @@ async def chat(req: ChatRequest, auth: Any = Depends(require_auth)) -> Dict[str,
             response["reply"] = reply_text
             response["llm_provider"] = "gemini"
             response["llm_model"] = _normalize_gemini_model_name(req.model)
+            _log_llm_event(
+                kind="chat",
+                snapshot_id=req.snapshot_id,
+                record={
+                    "model": response["llm_model"],
+                    "system_prompt": system_prompt,
+                    "messages": req.messages,
+                    "reply": reply_text,
+                },
+            )
         else:
             response["reply"] = None
             response["llm_error"] = error
+            _log_llm_event(
+                kind="chat",
+                snapshot_id=req.snapshot_id,
+                record={
+                    "model": _normalize_gemini_model_name(req.model),
+                    "system_prompt": system_prompt,
+                    "messages": req.messages,
+                    "error": error,
+                },
+            )
     else:
         response["reply"] = "请发送您的问题。"
     
