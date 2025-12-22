@@ -64,7 +64,7 @@ GEMINI_THINKING_LEVEL=high               # low/high，默认high
 
 **方式1：直接运行**
 ```bash
-python main_v3.py
+python main.py
 ```
 
 **方式2：使用uvicorn（推荐开发）**
